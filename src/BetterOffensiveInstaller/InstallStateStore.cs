@@ -10,6 +10,7 @@ internal sealed record InstallState(
     DateTimeOffset InstalledAtUtc,
     IReadOnlyList<string> InstalledFiles,
     IReadOnlyList<string> InstalledDirectories,
+    IReadOnlyList<ManagedExclusion> Exclusions,
     IReadOnlyList<BackedUpFile>? BackedUpFiles = null);
 
 internal sealed record BackedUpFile(string OriginalRelativePath, string BackupRelativePath);
@@ -31,7 +32,7 @@ internal static class InstallStateStore
                File.Exists(GetLegacyStateFilePath(installPath));
     }
 
-    public static InstallState? TryLoad(string installPath)
+    public static async Task<InstallState?> TryLoadAsync(string installPath, CancellationToken cancellationToken = default)
     {
         if (TryLoadFromRegistry(installPath, out var registryState))
         {
@@ -45,15 +46,10 @@ internal static class InstallStateStore
             return null;
         }
 
-        var state = JsonSerializer.Deserialize<InstallState>(File.ReadAllText(legacyStateFilePath), SerializerOptions);
+        await using var stream = new FileStream(legacyStateFilePath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, useAsync: true);
+        var state = await JsonSerializer.DeserializeAsync<InstallState>(stream, SerializerOptions, cancellationToken);
 
         return state ?? throw new InstallerAppException(InstallerErrorKind.InvalidInstallState);
-    }
-
-    public static Task<InstallState?> TryLoadAsync(string installPath, CancellationToken cancellationToken = default)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(TryLoad(installPath));
     }
 
     public static async Task SaveAsync(string installPath, InstallState state, CancellationToken cancellationToken = default)

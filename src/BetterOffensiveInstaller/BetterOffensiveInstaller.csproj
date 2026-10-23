@@ -11,8 +11,8 @@
     <Product>Better Offensive Installer</Product>
     <Company>Better Offensive</Company>
     <Copyright>Copyright (c) Better Offensive</Copyright>
-    <Version>1.3.0</Version>
-    <FileVersion>1.3.0</FileVersion>
+    <Version>1.2.0</Version>
+    <FileVersion>1.2.0</FileVersion>
     <UseWindowsForms>true</UseWindowsForms>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>

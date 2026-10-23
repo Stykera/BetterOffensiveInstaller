@@ -3,7 +3,6 @@ using System.IO;
 using System.IO.Compression;
 using System.Net.Http;
 using System.Windows.Forms;
-using Microsoft.Win32;
 
 namespace BetterOffensiveInstaller;
 
@@ -14,6 +13,7 @@ public sealed class MainForm : Form
 
     private readonly HttpClient _httpClient = CreateHttpClient();
     private readonly ReleaseService _releaseService;
+    private readonly DefenderExclusionService _defenderExclusionService = new();
 
     private readonly Label _titleLabel;
     private readonly Label _introLabel;
@@ -80,7 +80,6 @@ public sealed class MainForm : Form
             Size = new Size(176, 23)
         };
         _languageComboBox.SelectedIndexChanged += LanguageComboBox_SelectedIndexChanged;
-        _languageComboBox.DrawItem += LanguageComboBox_DrawItem;
 
         _introLabel = new Label
         {
@@ -234,22 +233,9 @@ public sealed class MainForm : Form
 
         PopulateLanguageList();
         ApplyLanguage(_currentLanguage);
-        ApplySystemTheme();
 
         Shown += async (_, _) => await LoadLatestReleaseAsync(showDialogOnError: true);
-        SystemEvents.UserPreferenceChanged += SystemEvents_UserPreferenceChanged;
-        FormClosed += (_, _) =>
-        {
-            SystemEvents.UserPreferenceChanged -= SystemEvents_UserPreferenceChanged;
-            _httpClient.Dispose();
-        };
-    }
-
-    protected override void OnHandleCreated(EventArgs e)
-    {
-        base.OnHandleCreated(e);
-        SystemTheme.ApplyTitleBar(this);
-        SystemTheme.ApplyProgressBar(_progressBar);
+        FormClosed += (_, _) => _httpClient.Dispose();
     }
 
     private InstallMode SelectedMode => _patchRadioButton.Checked ? InstallMode.Patch : InstallMode.Full;
@@ -349,6 +335,7 @@ public sealed class MainForm : Form
         }
 
         var selectedAsset = _currentRelease.GetAsset(SelectedMode);
+        var rollbackExclusions = Array.Empty<string>();
         string installPath;
         string? tempRoot = null;
         string? archivePath = null;
@@ -365,6 +352,33 @@ public sealed class MainForm : Form
             Directory.CreateDirectory(tempRoot);
             Directory.CreateDirectory(installPath);
 
+            SetStatus(TextId.StatusConfiguringExclusions, true, 0);
+            ManagedExclusion[] managedExclusions;
+
+            if (await _defenderExclusionService.IsDefenderAvailableAsync())
+            {
+                managedExclusions = (await _defenderExclusionService
+                        .EnsureExcludedAsync([installPath, InstallerTempBasePath]))
+                    .ToArray();
+            }
+            else
+            {
+                SetStatus(TextId.StatusManualExclusionRequired, true, 0);
+
+                if (!PromptForManualAntivirusExclusions(installPath))
+                {
+                    SetBusyState(false, TextId.StatusReady, false, 0);
+                    return;
+                }
+
+                managedExclusions = [];
+            }
+
+            rollbackExclusions = managedExclusions
+                .Where(exclusion => exclusion.AddedByInstaller)
+                .Select(exclusion => exclusion.Path)
+                .ToArray();
+
             var existingState = await InstallStateStore.TryLoadAsync(installPath);
             var progress = new Progress<InstallProgress>(UpdateProgress);
 
@@ -372,7 +386,7 @@ public sealed class MainForm : Form
             var extractedContent = await ExtractArchiveAsync(archivePath, installPath, existingState, progress);
 
             SetStatus(TextId.StatusSavingInstallState, true, 95);
-            var installState = BuildInstallState(installPath, existingState, _currentRelease.TagName, extractedContent);
+            var installState = BuildInstallState(installPath, existingState, _currentRelease.TagName, extractedContent, managedExclusions);
             await InstallStateStore.SaveAsync(installPath, installState);
 
             SetBusyState(false, TextId.InstallCompleteStatus, false, 100);
@@ -386,6 +400,8 @@ public sealed class MainForm : Form
         }
         catch (Exception ex)
         {
+            await TryRollbackExclusionsAsync(rollbackExclusions);
+
             var errorMessage = GetErrorMessage(ex);
             SetBusyState(false, TextId.InstallFailedPrefix, false, _progressBar.Value, errorMessage);
 
@@ -450,6 +466,13 @@ public sealed class MainForm : Form
 
             var progress = new Progress<InstallProgress>(UpdateProgress);
             await RemoveInstalledContentAsync(installPath, state, progress);
+
+            SetStatus(TextId.StatusRemovingExclusions, true, 92);
+            await _defenderExclusionService.RemoveExclusionsAsync(
+                state.Exclusions
+                    .Where(exclusion => exclusion.AddedByInstaller)
+                    .Select(exclusion => exclusion.Path));
+
             InstallStateStore.Delete(installPath);
 
             SetBusyState(false, TextId.UninstallCompleteStatus, false, 100);
@@ -484,6 +507,17 @@ public sealed class MainForm : Form
         SetStatus(progress.StatusTextId, progress.IsIndeterminate, (int)Math.Round(progress.Percent), progress.Arguments);
     }
 
+    private bool PromptForManualAntivirusExclusions(string installPath)
+    {
+        return MessageBox.Show(
+            this,
+            Format(TextId.DefenderUnavailableDialogFormat, installPath),
+            GetText(TextId.DefenderUnavailableTitle),
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+    }
+
     private void SetBusyState(bool isBusy, TextId statusTextId, bool indeterminate, int progressPercent, params object[] args)
     {
         _isBusy = isBusy;
@@ -509,56 +543,6 @@ public sealed class MainForm : Form
             }
 
             _progressBar.Value = Math.Clamp(progressPercent, 0, 100);
-        }
-
-        SystemTheme.ApplyProgressBar(_progressBar);
-    }
-
-    private void ApplySystemTheme()
-    {
-        SystemTheme.UseSystemAppMode();
-        SystemTheme.Apply(this);
-        _introLabel.ForeColor = SystemTheme.Current.MutedText;
-        _releaseDetailsLabel.ForeColor = SystemTheme.Current.MutedText;
-        _modeLabel.ForeColor = SystemTheme.Current.MutedText;
-        _statusLabel.ForeColor = SystemTheme.Current.MutedText;
-        SystemTheme.ApplyTitleBar(this);
-        SystemTheme.ApplyProgressBar(_progressBar);
-    }
-
-    private void SystemEvents_UserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
-    {
-        if (IsDisposed || e.Category is not (UserPreferenceCategory.General or UserPreferenceCategory.Color or UserPreferenceCategory.VisualStyle))
-        {
-            return;
-        }
-
-        BeginInvoke(ApplySystemTheme);
-    }
-
-    private void LanguageComboBox_DrawItem(object? sender, DrawItemEventArgs e)
-    {
-        if (e.Index < 0)
-        {
-            return;
-        }
-
-        var selected = (e.State & DrawItemState.Selected) != 0;
-        var background = selected ? SystemTheme.Current.Accent : SystemTheme.Current.Input;
-        var foreground = selected ? SystemTheme.Current.HighlightText : SystemTheme.Current.Text;
-        using var brush = new SolidBrush(background);
-        e.Graphics.FillRectangle(brush, e.Bounds);
-        TextRenderer.DrawText(
-            e.Graphics,
-            _languageComboBox.Items[e.Index]?.ToString() ?? string.Empty,
-            e.Font ?? Font,
-            e.Bounds,
-            foreground,
-            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
-
-        if ((e.State & DrawItemState.Focus) != 0)
-        {
-            e.DrawFocusRectangle();
         }
     }
 
@@ -732,7 +716,7 @@ public sealed class MainForm : Form
                 completedSteps++;
 
                 progress.Report(new InstallProgress(
-                    completedSteps / (double)totalSteps * 100d,
+                    completedSteps / (double)totalSteps * 90d,
                     false,
                     TextId.StatusRemovingInstalledFilesFormat,
                     completedSteps,
@@ -746,7 +730,7 @@ public sealed class MainForm : Form
                 completedSteps++;
 
                 progress.Report(new InstallProgress(
-                    completedSteps / (double)totalSteps * 100d,
+                    completedSteps / (double)totalSteps * 90d,
                     false,
                     TextId.StatusRemovingInstalledFilesFormat,
                     completedSteps,
@@ -766,7 +750,7 @@ public sealed class MainForm : Form
                 completedSteps++;
 
                 progress.Report(new InstallProgress(
-                    completedSteps / (double)totalSteps * 100d,
+                    completedSteps / (double)totalSteps * 90d,
                     false,
                     TextId.StatusRemovingInstalledFilesFormat,
                     completedSteps,
@@ -883,7 +867,8 @@ public sealed class MainForm : Form
         string installPath,
         InstallState? existingState,
         string releaseTag,
-        ExtractedContent extractedContent)
+        ExtractedContent extractedContent,
+        IReadOnlyList<ManagedExclusion> exclusions)
     {
         var installedFiles = new HashSet<string>(existingState?.InstalledFiles ?? [], StringComparer.OrdinalIgnoreCase);
         foreach (var filePath in extractedContent.Files)
@@ -913,6 +898,28 @@ public sealed class MainForm : Form
             }
         }
 
+        var exclusionMap = new Dictionary<string, ManagedExclusion>(StringComparer.OrdinalIgnoreCase);
+
+        if (existingState is not null)
+        {
+            foreach (var exclusion in existingState.Exclusions)
+            {
+                exclusionMap[exclusion.Path] = exclusion;
+            }
+        }
+
+        foreach (var exclusion in exclusions)
+        {
+            if (exclusionMap.TryGetValue(exclusion.Path, out var existingExclusion) && existingExclusion.AddedByInstaller)
+            {
+                exclusionMap[exclusion.Path] = new ManagedExclusion(exclusion.Path, true);
+            }
+            else
+            {
+                exclusionMap[exclusion.Path] = exclusion;
+            }
+        }
+
         var backupMap = new Dictionary<string, BackedUpFile>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var backedUpFile in existingState?.BackedUpFiles ?? [])
@@ -934,6 +941,7 @@ public sealed class MainForm : Form
             DateTimeOffset.UtcNow,
             installedFiles.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray(),
             installedDirectories.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray(),
+            exclusionMap.Values.OrderBy(entry => entry.Path, StringComparer.OrdinalIgnoreCase).ToArray(),
             backupMap.Values.OrderBy(entry => entry.OriginalRelativePath, StringComparer.OrdinalIgnoreCase).ToArray());
     }
 
@@ -1054,6 +1062,17 @@ public sealed class MainForm : Form
         try
         {
             RestoreBackedUpFile(installRoot, backedUpFile);
+        }
+        catch
+        {
+        }
+    }
+
+    private async Task TryRollbackExclusionsAsync(IEnumerable<string> paths)
+    {
+        try
+        {
+            await _defenderExclusionService.RemoveExclusionsAsync(paths);
         }
         catch
         {
